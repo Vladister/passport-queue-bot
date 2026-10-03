@@ -24,6 +24,12 @@ PLACEHOLDER_WORDS = (
     "обрати", "оберіть", "виберіть", "select", "choose", "--", "послуга", "день", "час"
 )
 
+NO_SLOTS_PHRASES = (
+    "На даний момент відсутні місця в електронній черзі",
+    "Наразі вільні слоти відсутні",
+    "вільні місця відсутні",
+)
+
 
 def now_text() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -149,6 +155,66 @@ def choose_service(service_select, services):
     return selected["text"]
 
 
+def _clean_text_list(items):
+    out = []
+    for text in items:
+        text = (text or "").strip()
+        low = text.casefold()
+        if not text or any(word in low for word in PLACEHOLDER_WORDS):
+            continue
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def _visible_option_texts(page):
+    # Works with many custom dropdown libraries that expose ARIA option roles.
+    try:
+        return _clean_text_list(page.get_by_role("option").all_inner_texts())
+    except Exception:
+        return []
+
+
+def _choose_custom_option(page, combo, text):
+    combo.click()
+    page.wait_for_timeout(400)
+    option = page.get_by_role("option", name=text, exact=True)
+    if option.count() == 0:
+        # Fallback for dropdowns implemented as plain text list items/buttons.
+        option = page.get_by_text(text, exact=True)
+    option.first.click()
+
+
+def _check_custom_combos(page, combos):
+    service_combo = combos.nth(0)
+    day_combo = combos.nth(1)
+
+    # Select only the requested service.
+    service_combo.click()
+    page.wait_for_timeout(500)
+    service_options = _visible_option_texts(page)
+    target = next((x for x in service_options if x.casefold() == TARGET_SERVICE.casefold()), None)
+    if not target:
+        target = next((x for x in service_options if TARGET_SERVICE.casefold() in x.casefold()), None)
+    if not target:
+        raise RuntimeError(
+            "Target service was not found in the custom service dropdown. "
+            f"Visible options: {service_options[:20]}"
+        )
+    page.get_by_role("option", name=target, exact=True).first.click()
+    page.wait_for_timeout(1200)
+
+    # We only need available dates to know that booking has opened.
+    day_combo.click()
+    page.wait_for_timeout(700)
+    days = _visible_option_texts(page)
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return target, [{"day": d, "time": ""} for d in days]
+
+
 def check_slots() -> dict:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -163,45 +229,72 @@ def check_slots() -> dict:
         page = context.new_page()
         try:
             page.goto(QUEUE_URL, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2500)
 
             body_text = page.locator("body").inner_text(timeout=10000)
             suspended = "Прийом на оформлення тимчасово призупинено" in body_text
+            no_slots = any(phrase.casefold() in body_text.casefold() for phrase in NO_SLOTS_PHRASES)
 
+            # When the site explicitly says there are no places, that is a normal
+            # "0 slots" state, not a bot failure. A maintenance banner alone is not
+            # enough to stop parsing because the form may still be present.
+            if no_slots:
+                return {
+                    "service": TARGET_SERVICE,
+                    "suspended": suspended,
+                    "slots": [],
+                    "checked_at": now_text(),
+                }
+
+            # Path 1: native HTML <select> controls.
             selects = page.locator("select")
-            count = selects.count()
-            if count < 3:
-                raise RuntimeError(
-                    f"Expected at least 3 <select> elements, found {count}. The site layout may have changed."
-                )
+            if selects.count() >= 2:
+                service_select = selects.nth(0)
+                day_select = selects.nth(1)
 
-            service_select = selects.nth(0)
-            day_select = selects.nth(1)
-            time_select = selects.nth(2)
+                services = wait_for_options(service_select, timeout_ms=15000)
+                selected_service = choose_service(service_select, services)
+                page.wait_for_timeout(1200)
+                days = wait_for_options(day_select, timeout_ms=7000)
 
-            services = wait_for_options(service_select, timeout_ms=15000)
-            selected_service = choose_service(service_select, services)
-            page.wait_for_timeout(1200)
+                # Available dates are enough for an immediate alert; the user opens
+                # the official page and completes booking/Diia or BankID manually.
+                slots = [{"day": d["text"], "time": ""} for d in days]
+                return {
+                    "service": selected_service,
+                    "suspended": suspended,
+                    "slots": slots,
+                    "checked_at": now_text(),
+                }
 
-            days = wait_for_options(day_select, timeout_ms=7000)
-            slots = []
+            # Path 2: modern/custom dropdown controls (ARIA comboboxes).
+            combos = page.get_by_role("combobox")
+            if combos.count() >= 2:
+                selected_service, slots = _check_custom_combos(page, combos)
+                return {
+                    "service": selected_service,
+                    "suspended": suspended,
+                    "slots": slots,
+                    "checked_at": now_text(),
+                }
 
-            for day in days:
-                try:
-                    day_select.select_option(value=day["value"])
-                    page.wait_for_timeout(800)
-                    times = wait_for_options(time_select, timeout_ms=3500)
-                    for t in times:
-                        slots.append({"day": day["text"], "time": t["text"]})
-                except PlaywrightTimeoutError:
-                    continue
+            # During a full maintenance closure the rendered form may disappear.
+            if suspended:
+                return {
+                    "service": TARGET_SERVICE,
+                    "suspended": True,
+                    "slots": [],
+                    "checked_at": now_text(),
+                }
 
-            return {
-                "service": selected_service,
-                "suspended": suspended,
-                "slots": slots,
-                "checked_at": now_text(),
-            }
+            # If the explicit "no slots" text disappeared but the form is still not
+            # parseable, treat this as important: the page state changed and the user
+            # should check it immediately instead of silently missing an opening.
+            snippet = " ".join(body_text.split())[:700]
+            raise RuntimeError(
+                "Queue page changed: the no-slots message is gone, but no supported "
+                f"dropdowns were found. Open the page immediately. Page text: {snippet}"
+            )
         finally:
             browser.close()
 
@@ -223,7 +316,10 @@ def notify_if_needed(result: dict):
             "",
         ]
         for slot in new_slots[:20]:
-            lines.append(f"📅 {slot['day']}   🕐 {slot['time']}")
+            if slot.get("time"):
+                lines.append(f"📅 {slot['day']}   🕐 {slot['time']}")
+            else:
+                lines.append(f"📅 {slot['day']}")
         if len(new_slots) > 20:
             lines.append(f"…і ще {len(new_slots) - 20} слотів")
         lines += ["", "Відкрий сторінку та бронюй:", QUEUE_URL]
@@ -264,7 +360,19 @@ def main():
         )
 
     if RUN_ONCE:
-        run_check()
+        try:
+            run_check()
+        except Exception as exc:
+            try:
+                send_message(
+                    "⚠️ Монітор не зміг перевірити чергу.\n"
+                    "Сторінка могла змінитися або тимчасово блокувати автоматичну перевірку.\n"
+                    f"Помилка: {redact(str(exc))[:1200]}\n\n"
+                    f"Перевірити вручну: {QUEUE_URL}"
+                )
+            except Exception:
+                pass
+            raise
         return
 
     if CHECK_INTERVAL_MINUTES < 5:
